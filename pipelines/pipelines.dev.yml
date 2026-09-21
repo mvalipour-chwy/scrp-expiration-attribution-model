@@ -1,0 +1,130 @@
+- name: pipeline_with_dependencies
+  tasks:
+  - script: extract_to_s3.sql
+  - script: main.py
+    type: spark
+    depends_on:
+    - extract_to_s3.sql
+  - script: example_templated_sql.sql
+    depends_on:
+    - main.py
+
+
+- name: parallel_python
+  tasks:
+  - script: another_main.py
+    type: spark
+  - script: main.py
+    type: spark
+
+
+- name: sequential_sql
+  params:
+    sql_row_limit: 100
+  tasks:
+  - script: select_1.sql
+  - script: example_templated_sql.sql
+    depends_on:
+    - select_1.sql
+
+
+- name: ml_job_spark
+  params:
+    horizon: 365
+    train_start: 2020-01-01
+    models: prophet,xgboost
+  tasks:
+    - script: main.py
+      type: spark
+      requirements:
+        - prophet
+        - optuna
+
+
+- name: ml_job_ray
+  tasks:
+    - script: main_ray.py
+      type: ray
+      number_of_workers: 1
+      requirements:
+        - prophet
+        - optuna
+
+
+- name: python_on_mwaa_local
+  params:
+    horizon: 365
+    train_start: 2020-01-01
+    models: prophet,xgboost
+  tasks:
+    - script: simple_main.py
+
+
+- name: ml_job_sagemaker
+  params:
+    horizon: 365
+    train_start: 2020-01-01
+    models: prophet,xgboost
+  tasks:
+    - script: entrypoint_sagemaker.py
+      type: sagemaker
+      #optional job name suffix to override using the script name from above
+      # job_name_suffix: ml
+      resources:
+        instance_count: 1
+        volume_size_in_gb: 20
+      inputs:
+        - name: actuals_data
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/oreo/features/MC1_CUSTOMER_SEGMENT_FIN_METRIC_ACTUALS/
+          s3_data_distribution_type: ShardedByS3Key
+          local_path: /opt/ml/processing/input/actuals/
+        - name: holiday file
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/mc2_argos_forecast/data/input/processed/holiday_info/process_date=2024-04-08/holidays.json
+          local_path: /opt/ml/processing/input/config/
+          s3_data_distribution_type: FullyReplicated
+      outputs:
+        - local_path: /opt/ml/processing/output
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/herald/projects/{{params.project_name}}/snapshot_date={{params.snapshot_date}}/run_date={{params.run_date}}/data/output/
+      
+    - script: simple_main.py
+      depends_on:
+        - entrypoint_sagemaker.py
+
+
+- name: one_of_everything
+  params:
+    horizon: 365
+    train_start: 2020-01-01
+    models: prophet,xgboost
+  tasks:
+    - script: entrypoint_sagemaker.py
+      type: sagemaker
+      #optional job name suffix to override using the script name from above
+      # job_name_suffix: ml
+      resources:
+        instance_count: 1
+        volume_size_in_gb: 20
+      inputs:
+        - name: actuals_data
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/oreo/features/MC1_CUSTOMER_SEGMENT_FIN_METRIC_ACTUALS/
+          s3_data_distribution_type: ShardedByS3Key
+          local_path: /opt/ml/processing/input/actuals/
+        - name: holiday file
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/mc2_argos_forecast/data/input/processed/holiday_info/process_date=2024-04-08/holidays.json
+          local_path: /opt/ml/processing/input/config/
+          s3_data_distribution_type: FullyReplicated
+      outputs:
+        - local_path: /opt/ml/processing/output
+          s3_uri: s3://dev-use1-worker-replen-mwaa-data/herald/projects/{{params.project_name}}/snapshot_date={{params.snapshot_date}}/run_date={{params.run_date}}/data/output/
+    - script: main.py
+      type: spark
+      depends_on:
+        - entrypoint_sagemaker.py
+    - script: sql_with_run_date.sql
+      depends_on:
+        - main.py
+    - script: simple_main.py
+      depends_on:
+        - main.py
+
+    

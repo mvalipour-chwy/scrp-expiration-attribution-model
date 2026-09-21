@@ -1,0 +1,251 @@
+library 'jenkins-library'
+
+group_name = "herald_template_repos"
+project_name = env.REPO.replace("-", "_")
+
+version = 1
+
+environments = ['worker_replen_dev':'975050012539', 'worker_replen_stg':'905418136874', 'worker_replen_prd':'471112510882']
+region_short = ['us-east-1':'use1', 'us-east-2':'use2']
+account_names = ['worker_replen_dev':'dev', 'worker_replen_stg':'stg', 'worker_replen_prd':'prd']
+
+// note - double space is correct
+cr_template_name = 'SC-forecast-mwaa -  incremental releases, updates & bug fixes'
+account_requires_cr = 'worker_replen_prd'
+prod_account_name = 'worker_replen_prd'
+
+// to test boreas integration from lower env (dev), uncomment these 2 lines and
+//   uncomment the snow_environment environment variable below
+// account_requires_cr = 'worker_replen_dev'
+// cr_template_name = 'Mock - PET Boreas - ServiceNow Integration Service'
+
+COLORS = [
+    'success': '#24d568',
+    'info': '#00b3f0',
+    'danger': '#ff6f70',
+]
+
+PROJECT_FRIENDLY_NAME = project_name
+
+
+/**
+ * @param status - one of SUCCESS, FAILED, etc.
+ * @param extraMessage - any additional info, such as about a CR closing
+ */
+def sendNotification(color, status, extraMessage) {
+    println("sending slack for env ${env.segmented_account_name}")
+    def chewyHandle = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0].userName.split("@")[0]
+    def channel_environment = env.segmented_account_name == prod_account_name ? 'prod' : 'nonprod'
+    def message = "#`${env.BUILD_NUMBER}` *[${account_names.get(env.segmented_account_name).toUpperCase()}] Deploy ${status}* - ${PROJECT_FRIENDLY_NAME} \n"
+    if (extraMessage) {
+        message += extraMessage
+        message += "\n"
+    }
+    message += "Started by @${chewyHandle}\n"
+    message += "Branch `${params.branch}`\n"
+    message += "<${env.BUILD_URL}|Open in Jenkins>"
+    slackSend channel: "#scfe-deploys-${channel_environment}",  color: "${color}", message: message
+}
+
+pipeline {
+    agent {
+        label 'deploy'
+    }
+
+    environment {
+        // snow_environment = "https://servicenow-integration-service-preprod.shss.chewy.com"
+
+        GIT_SHORT_COMMIT = env.GIT_COMMIT.substring(0, 8)
+    }
+
+    stages {
+
+        stage('start CR') {
+            when { expression { env.segmented_account_name == account_requires_cr } }
+            steps {
+                script {
+                    println("CR_NUMBER: ${params.CR_INC_NUMBER}")
+                    println("EMERGENCY: ${params.EMERGENCY}")
+                    println("segmented_account_name: ${env.segmented_account_name}")
+
+                    if (params.CR_INC_NUMBER) {
+                        println("Not a standard CR")
+                        env.CR_NUMBER = params.CR_INC_NUMBER
+                        env.IS_STANDARD_CR = "false"
+                        boreas.validateAndStartChange(params.CR_INC_NUMBER, params.EMERGENCY)
+                    } else {
+                        println("Starting a standard CR")
+                        env.IS_STANDARD_CR = "true"
+                        
+                        def open_data = [
+                            'assignment_group': 'SC-FORECASTING-RETAIL',
+                            'assigned_to': boreas.getUserId(),
+                            'template_name': cr_template_name,
+                        ]
+
+                        env.CR_NUMBER = boreas.createCR(open_data)
+                        println("The CR number ${env.CR_NUMBER}")
+                        boreas.startCR(env.CR_NUMBER)
+                    }
+                }
+            }
+        }
+
+        stage("Build for Glue jobs") {
+            when {
+                expression {
+                    fileExists('lib/')
+                }
+            }
+            steps {
+                script {
+                    sh '''
+                        zip -r lib.zip lib -x "**/__pycache__/*"
+                        mkdir temp_ray_dir
+                        cp -r lib/ temp_ray_dir/
+                        ls temp_ray_dir
+                        zip -r lib_ray.zip temp_ray_dir -x "**/__pycache__/*"
+                        zipinfo -1 lib_ray.zip
+                        rm -rf temp_ray_dir
+                    '''
+                }
+            }
+        }
+
+        stage('Docker build and push') {
+            when {
+                expression {
+                    fileExists('Dockerfile')
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'jenkins-github-userpass',
+                                                  passwordVariable: 'GRGIT_PASS',
+                                                  usernameVariable: 'GRGIT_USER')]) {
+                    script {
+                        def baseImageUri = "278833423079.dkr.ecr.us-east-1.amazonaws.com/scff/herald-template-repos"
+                        def imageTag = "${project_name}-${env.GIT_SHORT_COMMIT}"
+                        def imageUri = "${baseImageUri}:${imageTag}"
+                        sh """#!/bin/bash
+                                ${ecrLogin()}
+                                docker build -t ${imageUri} .
+                        """
+
+                        sh """#!/bin/bash
+                                ${ecrLogin()}
+                                docker push --all-tags ${baseImageUri}
+                        """
+
+                        env.IMAGE_URI = imageUri
+                    }
+                }
+            }
+        }
+
+        stage("Create project config") {
+            steps {
+                script {
+                    def projectConfig = [
+                        "project_name": project_name,
+                        "version": version,
+                    ]
+
+                    if (env.IMAGE_URI) {
+                        projectConfig.image_uri = env.IMAGE_URI
+                    }
+
+                    writeYaml file: 'project.yml', data: projectConfig
+                }
+            }
+        }
+
+        stage("Deploy") {
+            steps {
+                script {
+                    println "INFO: ${env.region}"
+                    def region = region_short.get(env.region)
+                    withAWS(role:"arn:aws:iam::${environments.get(env.segmented_account_name)}:role/CHEWY-cross-jenkins") {
+                        // validation steps
+                        if (project_name == null || project_name == "") {
+                            currentBuild.result = 'ABORTED'
+                            error('project_name must be defined')
+                        }
+
+                        if (group_name == null || group_name == "") {
+                            currentBuild.result = 'ABORTED'
+                            error('group_name must be defined')
+                        }
+
+                        // completely replace the existing project in S3,
+                        // this is safe after the above validation
+                        sh """
+                            aws s3 sync . s3://${account_names.get(env.segmented_account_name)}-${region}-worker-replen-repository/dags/${group_name}/${project_name}/ \
+                                --exclude ".git/*" \
+                                --exclude ".gitignore" \
+                                --exclude ".herald/*" \
+                                --exclude ".venv/*" \
+                                --exclude "venv/*" \
+                                --exclude ".env/*" \
+                                --exclude "env/*" \
+                                --exclude ".docker/*" \
+                                --delete \
+                                --acl bucket-owner-full-control \
+                                --sse aws:kms
+                        """
+                    }
+                }
+            }
+        }
+
+    }
+    
+    post {
+        always {
+            script {
+                currentBuild.description = "${env.segmented_account_name} | ${params.branch} | ${env.GIT_SHORT_COMMIT}"
+            }
+        }
+
+        success {
+            script {
+                def status = "SUCCESS"
+                def extraMessage = null
+
+                // The CR is left open because proof of testing is still a manual step
+                if (env.segmented_account_name == account_requires_cr) {
+                    extraMessage = "${env.CR_NUMBER} - NEEDS ACTION - please add proof of testing to the CR then close it with `Closed Successful` substate."
+                }
+
+                sendNotification(COLORS['success'], status, extraMessage)
+            }
+        }
+
+        failure {
+            script {
+                def status = "FAILED"
+                def extraMessage = null
+
+                if (env.segmented_account_name == account_requires_cr) {
+                    if (env.IS_STANDARD_CR == "true") {
+                        // if standard CR, then let Jenkins close it
+                        def close_data = [
+                            'substate': 'CLOSED_CANCELLED',
+                            'was_the_change_properly_validated': true,
+                            'did_we_achieve_the_expected_outcome': false,
+                            'substate_details': "${env.CR_NUMBER} - Failed to deploy code."
+                        ]
+                        boreas.closeCR(env.CR_NUMBER, close_data)
+                        extraMessage = "${env.CR_NUMBER} ${close_data['substate']}"
+                        println("Closed (failure). CR_NUMBER=${env.CR_NUMBER}")
+                    } else {
+                        extraMessage = "${env.CR_NUMBER} - NEEDS ACTION - the CR is still open and needs manual closure"
+                    }
+                }
+
+                sendNotification(COLORS['danger'], status, extraMessage)
+            }
+
+        }
+    }
+
+}

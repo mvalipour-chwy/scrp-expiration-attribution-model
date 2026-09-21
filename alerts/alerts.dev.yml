@@ -1,0 +1,22 @@
+alerts:
+  - id: alert_uta_ratios
+    schedule:
+      triggered_by:
+        # list of dag ids
+        - sequential_sql
+    notifications:
+      - method: email
+        recipients:
+          - jmortenson@chewy.com
+      # - method: slack
+    triggers:
+      - query: |
+          select count(*) as row_count
+          from edldb.SC_USER_TOOLS_ANALYTICS_SANDBOX.uta_ratios_test 
+          where 
+            snapshot_date = (select max(snapshot_date) from edldb.SC_USER_TOOLS_ANALYTICS_SANDBOX.uta_ratios_test)
+            and (percentile < 1 or percentile > 90)
+        threshold: row_count > 500
+        message: |
+          Found {{row_count}} rows where percentile < 1 or percentile > 99
+          for the latest snapshot date.
