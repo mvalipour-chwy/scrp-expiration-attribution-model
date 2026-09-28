@@ -1,3 +1,0 @@
-select *
-from {{ params.edldb_db_name }}.SC_USER_TOOLS_ANALYTICS_SANDBOX.UTA_SEASONALITY_INDX_ORDERED_UNITS
-limit 10
